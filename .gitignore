@@ -1,6 +1,6 @@
 # Ignore the specific data folder
 SkySat_ME_noSaturation/
-
+hdr-dsp-real-dataset/
 # Ignore Python cache and environments
 __pycache__/
 venv/
