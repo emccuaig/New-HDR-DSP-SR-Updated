@@ -1,11 +1,11 @@
-""" Python script to train option J """
+""" Python script to train option J - Dynamic Folder Detection Version """
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 import argparse
 from tqdm import tqdm
 from time import time
-
+import random # Added missing import for random used in Dataset transform
 
 from torch.utils.data import Dataset, DataLoader
 import torch 
@@ -14,11 +14,10 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torch.nn.functional as F
 
+# Ensure these imports exist in your project folder
 from models import EncoderNet, DecoderNet, FNet
 from shiftandadd import shiftAndAdd, featureAdd, featureWeight
-
 from warpingOperator import WarpedLoss, TVL1, base_detail_decomp, BlurLayer
-import os
 from torch.autograd import Variable
 from torchvision.transforms import GaussianBlur
 
@@ -30,22 +29,16 @@ def safe_mkdir(path):
     except OSError:
         pass
 
-
-
 def flowEstimation(samplesLR, ME, device, gaussian_filter , warping, sr_ratio = 2):
     """
     Compute the optical flows from the other frames to the reference:
     samplesLR: Tensor b, num_im, h, w
     ME: Motion Estimator
     """
-
     b, num_im, h, w = samplesLR.shape
-
     samplesLRblur = gaussian_filter(samplesLR)
 
-
     samplesLR_0 = samplesLRblur[:,:1,...] #b, 1, h, w
-
 
     samplesLR_0 = samplesLR_0.repeat(1, num_im, 1,1)  #b, num_im, h, w
     samplesLR_0 = samplesLR_0.reshape(-1, h, w)
@@ -59,8 +52,6 @@ def flowEstimation(samplesLR, ME, device, gaussian_filter , warping, sr_ratio = 
 
     return flow.reshape(b, num_im, 2, h, w), warploss
 
-
-
 def DeepSaaSuperresolve_weighted_base(samplesLR, flow, base, Encoder, Decoder, device, feature_mode, num_features = 64, sr_ratio=2, phase = 'training'):
     """
     samplesLR: b, num_im, h, w
@@ -68,22 +59,16 @@ def DeepSaaSuperresolve_weighted_base(samplesLR, flow, base, Encoder, Decoder, d
     """
     nb_mode = len(feature_mode)
 
-    #base, detail = base_detail_decomp(samplesLR[:,:1], gaussian_filter) #b, 1, h, w
-
     if phase == 'training':        
         samplesLR = samplesLR[:,1:,...].contiguous() #b, (num_im-1), h, w
         flow = flow[:,1:].contiguous()#.view(-1, 1, 2, h, w)
         base = base[:,1:].contiguous()
     b, num_im, h, w = samplesLR.shape
 
-    #base = base.repeat(1,num_im, 1,1).view(-1,1,h,w)
-    #base = warping.warp(base, flow.view(-1,2,h,w)) #b*num_im, 1, h, w
-
     samplesLR = samplesLR.view(-1,1,h,w)
     base = base.view(-1,1,h,w)
-
     
-    inputEncoder = torch.cat((samplesLR, base), dim = 1)#samplesLR_detail.view(-1, 1, h, w) #b*(num_im-1), 1, h, w
+    inputEncoder = torch.cat((samplesLR, base), dim = 1)
     features = Encoder(inputEncoder) #b * (num_im-1), num_features, h, w
     features = features.view(-1, h, w) # b * num_im-1 *num_features, h, w
 
@@ -101,28 +86,25 @@ def DeepSaaSuperresolve_weighted_base(samplesLR, flow, base, Encoder, Decoder, d
         elif feature_mode[i] == 'Std':
             SR[:, i*num_features:(i+1)*num_features] = torch.std(dadd, dim = 1, keepdim = False)
         elif feature_mode[i] == 'Avg':
-            #dadd = torch.sum(dadd, 1) #b, num_features, sr_ratioh, sr_ratiow
             dacc = torch.sum(dacc, 1)
             dacc[dacc == 0] = 1
             SR[:, i*num_features:(i+1)*num_features] = torch.sum(dadd, 1)/dacc
             SR[:, -1:] = dacc/15. #normalization/nb of frames
     SR = Decoder(SR.to(device)) #b, 1, sr_ration*h, sr_ratio*w
-    #SR = torch.squeeze(SR, 1)
 
     return SR
 
 
-
-
 class SkySatRealDataset_ME(Dataset):
     def __init__(self, path, augmentation = False,  phase = 'train', normalization = 3400., num_images = 15):
+        # Dynamically load based on the num_images passed to the init
         self.expotime = torch.from_numpy(np.load(os.path.join(path, '{}'.format(phase), str(num_images), '{}Ratio.npy'.format(phase)))[...,None,None])
         self.data = torch.from_numpy(np.load(os.path.join(path, '{}'.format(phase), str(num_images), '{}LR.npy'.format(phase)))/normalization)
-
             
         self.len = self.expotime.size()[0]
         self.augmentation = augmentation
         self.num_images = num_images
+
     def transform(self, data):
         # Random crop
         h, w = data.shape[-2:]
@@ -184,7 +166,7 @@ def test(args):
     checkpoint = torch.load("checkpoint.pth.tar", map_location=torch.device('cpu'))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(device)
+    print(f"Using device: {device}")
 
     Decoder = DecoderNet(in_dim=1+nb_mode*num_features).float().to(device)
     Encoder = EncoderNet(in_dim=2,conv_dim=64, out_dim=num_features, num_blocks=num_blocks).float().to(device)
@@ -198,16 +180,38 @@ def test(args):
 
     TVLoss = TVL1(TVLoss_weight=1)
     warping = WarpedLoss(interpolation = 'bicubicTorch') 
-    ##################
     
+    # ------------------------------------------------------------
+    # DYNAMIC FOLDER DETECTION LOGIC
+    # ------------------------------------------------------------
     Dataset_path = 'SkySat_ME_noSaturation/'
+    test_path_root = os.path.join(Dataset_path, 'test')
+    
+    # Check if main test directory exists
+    if not os.path.isdir(test_path_root):
+        print(f"Error: The test directory {test_path_root} does not exist.")
+        return
+
+    # 1. Get all items in 'test/' folder
+    # 2. Filter for items that are directories AND numbers (e.g., '6', '10', '15')
+    # 3. Sort them numerically
+    available_folders = [
+        int(name) for name in os.listdir(test_path_root) 
+        if os.path.isdir(os.path.join(test_path_root, name)) and name.isdigit()
+    ]
+    available_folders.sort()
+
+    if len(available_folders) == 0:
+        print(f"No numbered folders found in {test_path_root}.")
+        return
+
+    print(f"Detected the following sequence lengths for testing: {available_folders}")
+
     test_loader = {}
          
-    for i in range(6,16):
-        folder_i = os.path.join(Dataset_path, 'test', str(i))
-        if not os.path.isdir(folder_i):
-            print(f"Skipping test length {i}: folder not found ({folder_i})")
-            continue
+    # Iterate over the detected numbers only
+    for i in available_folders:
+        print(f"Preparing loader for sequence length: {i}")
         transformedDataset = SkySatRealDataset_ME(Dataset_path, augmentation=False, phase='test', num_images=i)
         test_loader[str(i)] = torch.utils.data.DataLoader(transformedDataset, batch_size=val_bs,
                                                        num_workers=1, shuffle=False)
@@ -218,11 +222,13 @@ def test(args):
     Encoder.eval()
 
     with torch.no_grad():
-        # Iterate over only the sequence lengths that have a test loader (skip missing ones)
+        # Iterate through the dynamically created keys
         for n_str in sorted(test_loader.keys(), key=lambda x: int(x)):
             n = int(n_str)
+            print(f"Processing sequence length: {n}")
             savepath = f"Results/{n}"
             safe_mkdir(savepath)
+            
             for k, (samplesLR, expotime) in enumerate(test_loader[n_str]):
 
                 samplesLR = samplesLR.float().to(device)
@@ -237,7 +243,7 @@ def test(args):
 
                 # SR for the detail
                 SR_detail = DeepSaaSuperresolve_weighted_base(detail, flow=flow, base = samplesLR, Encoder=Encoder, Decoder=Decoder,
-                                        device = device, feature_mode= feature_mode, num_features = num_features, sr_ratio=sr_ratio, phase = 'validation')
+                                                        device = device, feature_mode= feature_mode, num_features = num_features, sr_ratio=sr_ratio, phase = 'validation')
 
                 # SR for the base
                 SR_base = zoombase_weighted(base, expotime, flow, device, warping)
