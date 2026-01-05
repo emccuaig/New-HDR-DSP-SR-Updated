@@ -248,7 +248,7 @@ def train(args):
     warping = WarpedLoss(interpolation = 'bicubicTorch') 
     
     # --- DYNAMIC DATASET LOADING START ---
-    Dataset_path = 'SkySat_ME_noSaturation/' 
+    Dataset_path = "../data/SkySat_ME_noSaturation" 
     train_loader = {}
     val_loader = {}
     
